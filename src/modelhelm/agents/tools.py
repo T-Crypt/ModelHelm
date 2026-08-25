@@ -11,16 +11,86 @@ Safety model:
       - "ask"   -> raises ToolNeedsApproval, operation never runs
       - "allow" -> operation proceeds
 """
+import fnmatch
+import re
 import subprocess
 from pathlib import Path
 
 from modelhelm.policies.engine import PolicyEngine, PathScopeError
 from modelhelm.git.inspector import GitInspector
 
-# Commands matched (case-insensitively) as substrings before a shell
-# command is allowed to run without triggering the destructive_commands
-# policy check.
-DESTRUCTIVE_PATTERNS = ["rm -rf", "del /f", "format ", "drop database", "drop table"]
+# --- Phase 1 shell-command gating -------------------------------------------
+#
+# LIMITATION (deliberate, Phase 1): everything below is pattern matching over
+# the raw command string, NOT a shell parser. It does not understand quoting,
+# variable expansion, aliases, `sh -c "..."` nesting, base64-encoded payloads,
+# or `;`/`&&` chaining into an equivalent-but-differently-spelled command. It
+# exists to close the concrete bypasses that let a model route a gated
+# operation (a commit, a push, a recursive delete) through `run_command` and
+# skip the policy engine entirely. A later phase should replace it with real
+# argv-level parsing (e.g. shlex + per-executable rules).
+
+# Git subcommands that have a dedicated policy operation. When one of these
+# appears inside a run_command string it MUST be routed to the same
+# PolicyEngine operation the dedicated tool uses, or `run_command` becomes a
+# universal bypass of the git gates. Word-boundary anchored so `gitcommit` or
+# `mygit committer` do not match.
+GIT_COMMIT_PATTERN = re.compile(r"\bgit\b[^\n;&|]*?\bcommit\b", re.IGNORECASE)
+GIT_PUSH_PATTERN = re.compile(r"\bgit\b[^\n;&|]*?\bpush\b", re.IGNORECASE)
+# A push carrying any of these flags is a *force* push, a separate (stricter)
+# policy operation than a plain push.
+FORCE_PUSH_FLAG_PATTERN = re.compile(
+    r"(?:^|\s)(?:--force-with-lease(?:=\S*)?|--force|-f)(?=\s|$)", re.IGNORECASE
+)
+
+# Destructive-command blocklist. Case-insensitive regexes rather than plain
+# substrings because flag order and spacing vary freely in real commands
+# (`rm -rf`, `rm -fr`, `rm -r -f`, `rm  --recursive --force`, ...). Same Phase 1
+# caveat as above: a blocklist, not a parser.
+DESTRUCTIVE_PATTERNS = [
+    # rm with BOTH a recurse flag and a force flag, in any order/spacing.
+    re.compile(
+        r"\brm\b(?=[^\n;&|]*(?:\s-\w*r|\s--recursive\b))"
+        r"(?=[^\n;&|]*(?:\s-\w*f|\s--force\b))",
+        re.IGNORECASE,
+    ),
+    # PowerShell Remove-Item with -Recurse and -Force (this machine is Windows).
+    re.compile(
+        r"\bRemove-Item\b(?=[^\n;&|]*\s-Recurse\b)(?=[^\n;&|]*\s-Force\b)",
+        re.IGNORECASE,
+    ),
+    # PowerShell forced delete without recursion (the del /f equivalent).
+    re.compile(r"\bRemove-Item\b[^\n;&|]*\s-Force\b", re.IGNORECASE),
+    re.compile(r"\bdel\b[^\n;&|]*\s/f\b", re.IGNORECASE),
+    re.compile(r"\bgit\b[^\n;&|]*\breset\b[^\n;&|]*\s--hard\b", re.IGNORECASE),
+    re.compile(
+        r"\bgit\b[^\n;&|]*\bclean\b(?=[^\n;&|]*(?:\s-\w*f|\s--force\b))", re.IGNORECASE
+    ),
+    re.compile(r"\bdd\b[^\n;&|]*\bif=", re.IGNORECASE),
+    re.compile(r"\bmkfs(?:\.\w+)?\b", re.IGNORECASE),
+    re.compile(r"\bchmod\b[^\n;&|]*\s-\w*R\w*\s+777\b"),
+    # curl/wget piped straight into a shell interpreter.
+    re.compile(
+        r"\b(?:curl|wget|iwr|Invoke-WebRequest)\b[^\n]*\|[^\n]*\b(?:sh|bash|zsh|powershell|pwsh|iex|Invoke-Expression)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bformat\s", re.IGNORECASE),
+    re.compile(r"\bdrop\s+database\b", re.IGNORECASE),
+    re.compile(r"\bdrop\s+table\b", re.IGNORECASE),
+]
+
+# Files an agent must never read into the LM Studio conversation. Matched
+# case-insensitively with fnmatch against both the file name and its
+# repo-relative POSIX path. Phase 1: a short hardcoded list, not configurable.
+SENSITIVE_READ_PATTERNS = [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "credentials*",
+    ".git/config",
+    "*/.git/config",
+]
 
 
 class ToolDenied(Exception):
@@ -59,8 +129,29 @@ class AgentTools:
             raise PathScopeError(f"path escapes repository scope: {path}")
         return resolved
 
+    def _is_sensitive_path(self, target: Path) -> bool:
+        """True if ``target`` looks like a credential/secret file that must not
+        be read into the model conversation."""
+        name = target.name.lower()
+        try:
+            relative = target.relative_to(self.repository).as_posix().lower()
+        except ValueError:  # pragma: no cover - path is always scoped by caller
+            relative = name
+        return any(
+            fnmatch.fnmatch(name, pattern.lower())
+            or fnmatch.fnmatch(relative, pattern.lower())
+            for pattern in SENSITIVE_READ_PATTERNS
+        )
+
     def read_file(self, path: str) -> str:
         target = self._resolve_scoped_path(path)
+        # Deny loudly rather than returning empty content: the model needs to
+        # know why, or it will keep retrying the same read.
+        if self._is_sensitive_path(target):
+            raise ToolDenied(
+                f"read_file denied: {path} matches a sensitive-file pattern "
+                "(credentials, keys and .env files are never readable by the agent)"
+            )
         return target.read_text()
 
     def write_file(self, path: str, content: str) -> str:
@@ -81,8 +172,31 @@ class AgentTools:
         target = self._resolve_scoped_path(path)
         return sorted(p.name for p in target.iterdir())
 
+    def _gate(self, operation: str, detail: str) -> None:
+        """Apply one policy operation with the standard ask/deny/allow semantics."""
+        verdict = self.policy_engine.check(operation)
+        if verdict == "deny":
+            raise ToolDenied(f"{operation} is denied by policy: {detail}")
+        if verdict == "ask":
+            raise ToolNeedsApproval(operation, detail)
+
     def run_command(self, command: str) -> dict:
-        if any(pattern in command.lower() for pattern in DESTRUCTIVE_PATTERNS):
+        # A shell string can spell any gated operation the dedicated tools
+        # gate, so route the recognisable ones through the SAME policy
+        # operations first — otherwise `run_command("git commit -m x")` walks
+        # straight past the git_commit gate. See the module-level note on the
+        # limits of this pattern-matching approach.
+        if GIT_PUSH_PATTERN.search(command):
+            # Force-push is a stricter, separate policy operation; check it
+            # instead of (not in addition to) the plain push gate.
+            if FORCE_PUSH_FLAG_PATTERN.search(command):
+                self._gate("force_push", command)
+            else:
+                self._gate("git_push", command)
+        if GIT_COMMIT_PATTERN.search(command):
+            self._gate("git_commit", command)
+
+        if any(pattern.search(command) for pattern in DESTRUCTIVE_PATTERNS):
             verdict = self.policy_engine.check("destructive_commands")
             if verdict == "deny":
                 raise ToolDenied(f"destructive command denied: {command}")
@@ -113,16 +227,27 @@ class AgentTools:
         if verdict == "ask":
             raise ToolNeedsApproval("git_commit", message)
 
-        subprocess.run(
-            ["git", "-C", str(self.repository), "add", "-A"],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(self.repository), "commit", "-m", message],
-            check=True,
-            capture_output=True,
-        )
+        # git's own stderr/stdout is the only thing that distinguishes "nothing
+        # to commit" from "no identity configured" from "pre-commit hook
+        # rejected". Raise ToolDenied so the agent loop feeds the detail back to
+        # the model as a tool result instead of killing the run.
+        try:
+            subprocess.run(
+                ["git", "-C", str(self.repository), "add", "-A"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(self.repository), "commit", "-m", message],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            # "nothing to commit" is reported on stdout, not stderr.
+            detail = (exc.stderr or "").strip() or (exc.stdout or "").strip()
+            raise ToolDenied(f"git commit failed: {detail}") from exc
         return f"committed: {message}"
 
 
