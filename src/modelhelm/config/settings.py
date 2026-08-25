@@ -16,7 +16,11 @@ class SafetyPolicy(BaseModel):
 
 class AgentConfig(BaseModel):
     max_iterations: int = 8
-    test_before_completion: bool = True
+    # Not yet implemented in Phase 1: the agent loop does not run tests and
+    # reports tests_run/passed/failed as 0. Test execution is deferred to a
+    # later phase; defaulting to False avoids promising behavior that does not
+    # exist.
+    test_before_completion: bool = False
 
 class LMStudioConfig(BaseModel):
     endpoint: str = "http://localhost:1234"

@@ -65,6 +65,9 @@ class LocalAgent:
         self.tools = tools
         self.git_inspector = git_inspector
         self.agent_config = agent_config
+        # Set at the start of each run(); see _build_result.
+        self._base_commit: str | None = None
+        self._base_dirty_files: set[str] = set()
 
     async def run(
         self,
@@ -81,6 +84,17 @@ class LocalAgent:
         conversation state needed to resume this same conversation later.
         """
         start_time = time.monotonic()
+        # Baseline for files_changed. Without it a pre-dirty repo gets its
+        # existing changes billed to the agent, and any commit the agent makes
+        # cleans the tree back to a count of zero. A repo with no commits yet
+        # (or no git at all) leaves the baseline None and falls back to the raw
+        # working-tree count.
+        try:
+            self._base_commit = self.git_inspector.snapshot().commit
+            self._base_dirty_files = self.git_inspector.dirty_files()
+        except Exception:
+            self._base_commit = None
+            self._base_dirty_files = set()
 
         if resume_messages is not None:
             # Copy so the caller's list is not mutated as the loop appends.
@@ -187,7 +201,14 @@ class LocalAgent:
 
     def _build_result(self, task_id, status, model, start_time, iterations, summary) -> TaskResult:
         duration = time.monotonic() - start_time
-        files_changed = self.git_inspector.files_changed_count()
+        # Count against the pre-task baseline so a commit made during the run
+        # still counts as changed files (and pre-existing dirt does not).
+        if self._base_commit is not None:
+            files_changed = self.git_inspector.files_changed_since(
+                self._base_commit, self._base_dirty_files
+            )
+        else:
+            files_changed = self.git_inspector.files_changed_count()
         return TaskResult(
             task_id=task_id,
             status=status,

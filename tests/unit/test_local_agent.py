@@ -196,6 +196,119 @@ async def test_resume_messages_continues_prior_conversation(tmp_path):
     assert pending is None
 
 
+@pytest.mark.asyncio
+async def test_files_changed_counts_work_that_was_committed_during_the_run(tmp_path):
+    """After a successful git_commit the tree is clean again, so a raw
+    `git status` count reported 0 files changed — which also wrongly suppressed
+    review_recommended on exactly the runs that committed something."""
+    _init_repo(tmp_path)
+    fake_client = FakeLMStudioClient([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path": "notes.txt", "content": "hi"}',
+                    },
+                },
+                {
+                    "id": "call_2",
+                    "function": {"name": "git_commit", "arguments": '{"message": "add notes"}'},
+                },
+            ],
+        },
+        {"role": "assistant", "content": "Committed.", "tool_calls": None},
+    ])
+    tools = AgentTools(
+        str(tmp_path),
+        PolicyEngine(SafetyPolicy(file_write="allow", git_commit="allow")),
+    )
+    agent = LocalAgent(
+        lmstudio_client=fake_client,
+        tools=tools,
+        git_inspector=GitInspector(str(tmp_path)),
+        agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
+    )
+
+    result, pending = await agent.run(
+        task_id="t12", description="write and commit a note", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "completed"
+    # The tree is clean post-commit, but the run really did change a file.
+    assert GitInspector(str(tmp_path)).files_changed_count() == 0
+    assert result.files_changed >= 1
+    assert result.review_recommended is True
+
+
+@pytest.mark.asyncio
+async def test_files_changed_excludes_dirt_that_predates_the_task(tmp_path):
+    """Changes already sitting in the working tree must not be billed to the
+    agent."""
+    _init_repo(tmp_path)
+    (tmp_path / "preexisting.txt").write_text("not the agent's doing")
+
+    fake_client = FakeLMStudioClient([
+        {"role": "assistant", "content": "Nothing to do.", "tool_calls": None},
+    ])
+    tools = AgentTools(str(tmp_path), PolicyEngine(SafetyPolicy()))
+    agent = LocalAgent(
+        lmstudio_client=fake_client,
+        tools=tools,
+        git_inspector=GitInspector(str(tmp_path)),
+        agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
+    )
+
+    result, _ = await agent.run(
+        task_id="t13", description="no-op", model="qwen3-coder-30b-a3b"
+    )
+
+    # The agent changed nothing, so the pre-existing dirt must not be billed to
+    # it -- and review_recommended must not be triggered by it either.
+    assert result.files_changed == 0
+    assert result.review_recommended is False
+
+
+@pytest.mark.asyncio
+async def test_files_changed_counts_agent_work_alongside_preexisting_dirt(tmp_path):
+    """Pre-existing dirt is excluded, but the agent's own new file still counts."""
+    _init_repo(tmp_path)
+    (tmp_path / "preexisting.txt").write_text("not the agent's doing")
+
+    fake_client = FakeLMStudioClient([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path": "agent.txt", "content": "mine"}',
+                    },
+                }
+            ],
+        },
+        {"role": "assistant", "content": "Done.", "tool_calls": None},
+    ])
+    tools = AgentTools(str(tmp_path), PolicyEngine(SafetyPolicy(file_write="allow")))
+    agent = LocalAgent(
+        lmstudio_client=fake_client,
+        tools=tools,
+        git_inspector=GitInspector(str(tmp_path)),
+        agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
+    )
+
+    result, _ = await agent.run(
+        task_id="t14", description="write a note", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.files_changed == 1
+
+
 def _make_agent(tmp_path, script, policy=None, max_iterations=8):
     """Build a LocalAgent over ``tmp_path`` driven by a scripted fake client.
 

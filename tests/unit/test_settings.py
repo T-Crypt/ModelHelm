@@ -1,4 +1,5 @@
 import textwrap
+from pathlib import Path
 from modelhelm.config.settings import load_settings, Settings
 
 def test_load_settings_from_file(tmp_path):
@@ -37,3 +38,13 @@ def test_load_settings_missing_file_returns_defaults(tmp_path):
     assert isinstance(settings, Settings)
     assert settings.default_runtime == "lm-studio"
     assert settings.safety.force_push == "deny"
+
+def test_test_before_completion_defaults_to_false():
+    """Test execution is not implemented in Phase 1, so the config must not
+    default to promising it."""
+    assert Settings().agent.test_before_completion is False
+
+def test_shipped_config_does_not_enable_test_before_completion():
+    repo_config = Path(__file__).resolve().parents[2] / "modelhelm.yaml"
+    settings = load_settings(str(repo_config))
+    assert settings.agent.test_before_completion is False
