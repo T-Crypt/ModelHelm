@@ -76,3 +76,32 @@ def test_get_pending_approval_returns_none_when_absent(tmp_path):
     store = TaskStore(str(tmp_path / "tasks.db"))
     task = store.create_task(description="add auth", repository="/repo")
     assert store.get_pending_approval(task.task_id) is None
+
+
+def test_delete_pending_approval_removes_record(tmp_path):
+    """A consumed approval must be deleted, or a repeated resume replays it."""
+    from modelhelm.tasks.models import PendingApproval
+
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    task = store.create_task(description="add auth", repository="/repo")
+    store.save_pending_approval(
+        task.task_id,
+        PendingApproval(
+            operation="git_commit",
+            detail="add notes",
+            tool_call_id="call_1",
+            messages=[{"role": "user", "content": "commit notes"}],
+        ),
+    )
+    assert store.get_pending_approval(task.task_id) is not None
+
+    store.delete_pending_approval(task.task_id)
+
+    assert store.get_pending_approval(task.task_id) is None
+
+
+def test_delete_pending_approval_is_idempotent(tmp_path):
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    task = store.create_task(description="add auth", repository="/repo")
+    store.delete_pending_approval(task.task_id)  # no record: must not raise
+    assert store.get_pending_approval(task.task_id) is None

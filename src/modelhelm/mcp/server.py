@@ -83,21 +83,36 @@ def create_server(
             return {"task_id": task.task_id, "status": "failed", "summary": str(exc)}
 
         task_store.set_status(task.task_id, "running", model=model)
-        policy_engine = PolicyEngine(settings.safety)
-        agent_tools = AgentTools(repository, policy_engine)
-        git_inspector = GitInspector(repository)
-        agent = LocalAgent(
-            lmstudio_client=lmstudio_client,
-            tools=agent_tools,
-            git_inspector=git_inspector,
-            agent_config=settings.agent,
-        )
-        result, pending = await agent.run(task_id=task.task_id, description=description, model=model)
-        task_store.set_status(task.task_id, result.status, model=model)
-        task_store.save_result(task.task_id, result)
-        if pending is not None:
-            task_store.save_pending_approval(task.task_id, pending)
-        return result.model_dump()
+        # Safety net: anything the agent loop can raise (PathScopeError,
+        # ToolDenied, subprocess failures, an httpx timeout talking to LM
+        # Studio) must become a structured failure. Letting it propagate out of
+        # an MCP tool leaves the task stuck in "running" with no result ever
+        # persisted.
+        try:
+            policy_engine = PolicyEngine(settings.safety)
+            agent_tools = AgentTools(repository, policy_engine)
+            git_inspector = GitInspector(repository)
+            agent = LocalAgent(
+                lmstudio_client=lmstudio_client,
+                tools=agent_tools,
+                git_inspector=git_inspector,
+                agent_config=settings.agent,
+            )
+            result, pending = await agent.run(
+                task_id=task.task_id, description=description, model=model
+            )
+            task_store.set_status(task.task_id, result.status, model=model)
+            task_store.save_result(task.task_id, result)
+            if pending is not None:
+                task_store.save_pending_approval(task.task_id, pending)
+            return result.model_dump()
+        except Exception as exc:
+            task_store.set_status(task.task_id, "failed", model=model)
+            return {
+                "task_id": task.task_id,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     async def get_task_status(task_id: str) -> dict:
         task = task_store.get_task(task_id)
@@ -144,47 +159,60 @@ def create_server(
         # message whose tool_calls include pending.tool_call_id to recover the
         # call's arguments, and find-and-replace (never append) the matching
         # placeholder tool-role message with the real result.
-        pending_call = next(
-            call
-            for message in pending.messages
-            if message.get("role") == "assistant" and message.get("tool_calls")
-            for call in message["tool_calls"]
-            if call["id"] == pending.tool_call_id
-        )
+        try:
+            pending_call = next(
+                call
+                for message in pending.messages
+                if message.get("role") == "assistant" and message.get("tool_calls")
+                for call in message["tool_calls"]
+                if call["id"] == pending.tool_call_id
+            )
         # Two distinct namespaces meet here and must not be conflated:
         # ``pending.operation`` is a *policy* operation name (a SafetyPolicy
         # field: file_write, git_commit, destructive_commands, ...) and is what
         # gets elevated to "allow"; ``pending_call["function"]["name"]`` is the
         # *tool* name (write_file, git_commit, run_command, ...) and is what
         # keys TOOL_DISPATCH. They coincide only for git_commit.
-        elevated_policy = settings.safety.model_copy(update={pending.operation: "allow"})
-        agent_tools = AgentTools(task.repository, PolicyEngine(elevated_policy))
-        tool_result = TOOL_DISPATCH[pending_call["function"]["name"]](
-            agent_tools, json.loads(pending_call["function"]["arguments"])
-        )
-        extended_messages = [
-            {**m, "content": str(tool_result)}
-            if m.get("role") == "tool" and m.get("tool_call_id") == pending.tool_call_id
-            else m
-            for m in pending.messages
-        ]
+            elevated_policy = settings.safety.model_copy(update={pending.operation: "allow"})
+            agent_tools = AgentTools(task.repository, PolicyEngine(elevated_policy))
+            tool_result = TOOL_DISPATCH[pending_call["function"]["name"]](
+                agent_tools, json.loads(pending_call["function"]["arguments"])
+            )
+            extended_messages = [
+                {**m, "content": str(tool_result)}
+                if m.get("role") == "tool" and m.get("tool_call_id") == pending.tool_call_id
+                else m
+                for m in pending.messages
+            ]
 
-        git_inspector = GitInspector(task.repository)
-        agent = LocalAgent(
-            lmstudio_client=lmstudio_client,
-            tools=AgentTools(task.repository, PolicyEngine(settings.safety)),
-            git_inspector=git_inspector,
-            agent_config=settings.agent,
-        )
-        result, new_pending = await agent.run(
-            task_id=task.task_id, description=task.description, model=task.model,
-            resume_messages=extended_messages,
-        )
-        task_store.set_status(task.task_id, result.status, model=task.model)
-        task_store.save_result(task.task_id, result)
-        if new_pending is not None:
-            task_store.save_pending_approval(task.task_id, new_pending)
-        return result.model_dump()
+            git_inspector = GitInspector(task.repository)
+            agent = LocalAgent(
+                lmstudio_client=lmstudio_client,
+                tools=AgentTools(task.repository, PolicyEngine(settings.safety)),
+                git_inspector=git_inspector,
+                agent_config=settings.agent,
+            )
+            result, new_pending = await agent.run(
+                task_id=task.task_id, description=task.description, model=task.model,
+                resume_messages=extended_messages,
+            )
+            task_store.set_status(task.task_id, result.status, model=task.model)
+            task_store.save_result(task.task_id, result)
+            # This approval has now been consumed. Drop it BEFORE saving any new
+            # one, or a second resume_task(approved=True) would silently replay
+            # the same operation against its original, now-stale arguments —
+            # potentially reverting edits a human made in between.
+            task_store.delete_pending_approval(task.task_id)
+            if new_pending is not None:
+                task_store.save_pending_approval(task.task_id, new_pending)
+            return result.model_dump()
+        except Exception as exc:
+            task_store.set_status(task.task_id, "failed", model=task.model)
+            return {
+                "task_id": task.task_id,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     tools = {
         "get_status": get_status,

@@ -126,3 +126,13 @@ class TaskStore:
         if row is None:
             return None
         return PendingApproval(**json.loads(row[0]))
+
+    def delete_pending_approval(self, task_id: str) -> None:
+        """Drop the pending-approval record for ``task_id``.
+
+        Must be called once an approval has been consumed: a stale record lets
+        a repeated resume_task(approved=True) silently re-execute the already
+        approved operation against its original (now outdated) arguments.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_approvals WHERE task_id = ?", (task_id,))

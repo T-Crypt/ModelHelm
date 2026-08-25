@@ -187,3 +187,152 @@ async def test_resume_task_approved_executes_pending_file_write(tmp_path):
 
     assert result["status"] == "completed"
     assert (repo / "notes.txt").read_text() == "hello"
+
+
+# --- C3: a consumed approval must not be replayable -------------------------
+
+@pytest.mark.asyncio
+async def test_second_resume_does_not_replay_the_approved_operation(server, tmp_path):
+    """Replaying a stale approval re-executes the original (now outdated)
+    arguments, silently reverting whatever a human changed in between."""
+    import subprocess
+    from modelhelm.tasks.models import PendingApproval
+
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
+    (tmp_path / "notes.txt").write_text("original")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"], check=True, capture_output=True)
+
+    task = server.task_store.create_task(description="write notes", repository=str(tmp_path))
+    server.task_store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    server.task_store.save_pending_approval(
+        task.task_id,
+        PendingApproval(
+            operation="file_write",
+            detail="write to notes.txt",
+            tool_call_id="call_1",
+            messages=[
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "write notes"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "notes.txt", "content": "agent version"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "not executed"},
+            ],
+        ),
+    )
+
+    first = await server.tools["resume_task"](task_id=task.task_id, approved=True)
+    assert first["status"] == "completed"
+    assert (tmp_path / "notes.txt").read_text() == "agent version"
+
+    # A human edits the file after the approved write landed.
+    (tmp_path / "notes.txt").write_text("human edit")
+
+    second = await server.tools["resume_task"](task_id=task.task_id, approved=True)
+
+    assert "error" in second
+    # The stale approval must NOT have overwritten the human's edit.
+    assert (tmp_path / "notes.txt").read_text() == "human edit"
+    assert server.task_store.get_pending_approval(task.task_id) is None
+
+
+# --- I3: MCP tools return structured failures, never raw exceptions ---------
+
+@pytest.mark.asyncio
+async def test_delegate_task_returns_failed_dict_on_lmstudio_timeout(tmp_path):
+    """An LM Studio timeout previously propagated out of the MCP tool, leaving
+    the task stuck in "running" with no result persisted."""
+    import httpx
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+
+    class TimingOutClient(FakeLMStudioClient):
+        async def chat_completion(self, model, messages, tools=None):
+            raise httpx.TimeoutException("timed out talking to LM Studio")
+
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    server = create_server(
+        settings=Settings(agent=AgentConfig(max_iterations=2, test_before_completion=False)),
+        task_store=store,
+        lmstudio_client=TimingOutClient(),
+        llmfit_client=FakeLlmfitClient(),
+    )
+
+    result = await server.tools["delegate_task"](description="x", repository=str(repo))
+
+    assert result["status"] == "failed"
+    assert "TimeoutException" in result["error"]
+    # The task must not be left stranded in "running".
+    assert store.get_task(result["task_id"]).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_returns_failed_dict_on_bad_repository(server):
+    """A repository path that does not exist must surface as a structured
+    failure rather than an unhandled subprocess/git error."""
+    result = await server.tools["delegate_task"](
+        description="x", repository="/definitely/not/a/repo"
+    )
+
+    assert result["status"] == "failed"
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_resume_task_returns_failed_dict_when_execution_raises(server, tmp_path):
+    """The approved tool call itself can fail (here: a write outside the repo
+    scope) -- resume_task must not leak the exception."""
+    from modelhelm.tasks.models import PendingApproval
+
+    task = server.task_store.create_task(description="write", repository=str(tmp_path))
+    server.task_store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    server.task_store.save_pending_approval(
+        task.task_id,
+        PendingApproval(
+            operation="file_write",
+            detail="write outside",
+            tool_call_id="call_1",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "../escape.txt", "content": "x"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "not executed"},
+            ],
+        ),
+    )
+
+    result = await server.tools["resume_task"](task_id=task.task_id, approved=True)
+
+    assert result["status"] == "failed"
+    assert "PathScopeError" in result["error"]
