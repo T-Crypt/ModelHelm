@@ -151,9 +151,15 @@ def create_server(
             for call in message["tool_calls"]
             if call["id"] == pending.tool_call_id
         )
+        # Two distinct namespaces meet here and must not be conflated:
+        # ``pending.operation`` is a *policy* operation name (a SafetyPolicy
+        # field: file_write, git_commit, destructive_commands, ...) and is what
+        # gets elevated to "allow"; ``pending_call["function"]["name"]`` is the
+        # *tool* name (write_file, git_commit, run_command, ...) and is what
+        # keys TOOL_DISPATCH. They coincide only for git_commit.
         elevated_policy = settings.safety.model_copy(update={pending.operation: "allow"})
         agent_tools = AgentTools(task.repository, PolicyEngine(elevated_policy))
-        tool_result = TOOL_DISPATCH[pending.operation](
+        tool_result = TOOL_DISPATCH[pending_call["function"]["name"]](
             agent_tools, json.loads(pending_call["function"]["arguments"])
         )
         extended_messages = [

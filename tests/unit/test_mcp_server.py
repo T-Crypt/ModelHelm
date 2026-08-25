@@ -123,3 +123,67 @@ async def test_resume_task_approved_executes_pending_commit_and_continues(server
         check=True, capture_output=True, text=True,
     )
     assert log.stdout.strip() == "add notes"
+
+@pytest.mark.asyncio
+async def test_resume_task_approved_executes_pending_file_write(tmp_path):
+    """A file_write approval must dispatch on the *tool* name (write_file), not
+    on the policy operation name (file_write) — the two namespaces coincide only
+    for git_commit, so a git_commit-only test cannot catch that confusion.
+    """
+    import subprocess
+    from modelhelm.tasks.models import PendingApproval
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+
+    # file_write="ask" is what makes AgentTools.write_file raise ToolNeedsApproval
+    # in the first place, so the resumed run must rely on the one-off elevation.
+    settings = Settings(
+        safety=SafetyPolicy(file_write="ask"),
+        agent=AgentConfig(max_iterations=2, test_before_completion=False),
+    )
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    server = create_server(
+        settings=settings,
+        task_store=store,
+        lmstudio_client=FakeLMStudioClient(),
+        llmfit_client=FakeLlmfitClient(),
+    )
+
+    task = store.create_task(description="write notes", repository=str(repo))
+    store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    store.save_pending_approval(
+        task.task_id,
+        PendingApproval(
+            operation="file_write",
+            detail="write to notes.txt",
+            tool_call_id="call_1",
+            messages=[
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "write notes"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "notes.txt", "content": "hello"}',
+                            },
+                        }
+                    ],
+                },
+                # Task 10's placeholder reply for the gated call.
+                {"role": "tool", "tool_call_id": "call_1", "content": "not executed: run paused pending approval"},
+            ],
+        ),
+    )
+
+    result = await server.tools["resume_task"](task_id=task.task_id, approved=True)
+
+    assert result["status"] == "completed"
+    assert (repo / "notes.txt").read_text() == "hello"
