@@ -1,0 +1,20 @@
+{
+  "models": [
+    {
+      "name": "Qwen/Qwen3-Coder-30B-A3B",
+      "capability_ids": ["tool_use"],
+      "fit_level": "Excellent",
+      "score": 98.5,
+      "context_length": 262144,
+      "estimated_tps": 62.3
+    },
+    {
+      "name": "groxaxo/Qwen3.6-27B-GPTQ-Pro-4bit",
+      "capability_ids": ["vision", "tool_use"],
+      "fit_level": "Good",
+      "score": 100.0,
+      "context_length": 262144,
+      "estimated_tps": 40.5
+    }
+  ]
+}

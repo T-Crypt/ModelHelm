@@ -1,0 +1,12 @@
+[
+  {
+    "name": "unsloth/Mistral-Small-24B-Instruct-2501-bnb-4bit",
+    "capabilities": ["tool_use"],
+    "context_length": 32768
+  },
+  {
+    "name": "AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16",
+    "capabilities": ["tool_use"],
+    "context_length": 262144
+  }
+]
