@@ -1,5 +1,5 @@
 import pytest
-from modelhelm.agents.local_agent import LocalAgent
+from modelhelm.agents.local_agent import LocalAgent, NOT_EXECUTED_MESSAGE
 from modelhelm.agents.tools import AgentTools
 from modelhelm.policies.engine import PolicyEngine
 from modelhelm.config.settings import SafetyPolicy, AgentConfig
@@ -22,8 +22,12 @@ class FakeLMStudioClient:
     def __init__(self, script):
         self.script = list(script)
         self.calls = 0
+        # Snapshot of the conversation as of each turn, so tests can assert on
+        # what the model would actually have seen.
+        self.received = []
 
     async def chat_completion(self, model, messages, tools=None):
+        self.received.append(list(messages))
         message = self.script[self.calls]
         self.calls += 1
         return {"choices": [{"message": message}]}
@@ -142,7 +146,16 @@ async def test_run_pauses_on_needs_approval(tmp_path):
     assert pending.operation == "git_commit"
     assert pending.detail == "add notes"
     assert pending.tool_call_id == "call_1"
-    assert pending.messages[-1]["tool_calls"][0]["function"]["name"] == "git_commit"
+    # The assistant turn that requested the gated call is retained, and the
+    # gated call itself carries a placeholder tool result so the conversation
+    # has no orphaned tool_call_id.
+    assistant_message = pending.messages[-2]
+    assert assistant_message["tool_calls"][0]["function"]["name"] == "git_commit"
+    assert pending.messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": NOT_EXECUTED_MESSAGE,
+    }
 
 
 @pytest.mark.asyncio
@@ -181,3 +194,210 @@ async def test_resume_messages_continues_prior_conversation(tmp_path):
 
     assert result.status == "completed"
     assert pending is None
+
+
+def _make_agent(tmp_path, script, policy=None, max_iterations=8):
+    """Build a LocalAgent over ``tmp_path`` driven by a scripted fake client.
+
+    Returns ``(agent, fake_client)`` so tests can inspect the messages the
+    client received on later turns.
+    """
+    fake_client = FakeLMStudioClient(script)
+    tools = AgentTools(str(tmp_path), PolicyEngine(policy or SafetyPolicy()))
+    agent = LocalAgent(
+        lmstudio_client=fake_client,
+        tools=tools,
+        git_inspector=GitInspector(str(tmp_path)),
+        agent_config=AgentConfig(max_iterations=max_iterations, test_before_completion=False),
+    )
+    return agent, fake_client
+
+
+def _tool_messages(messages):
+    return [m for m in messages if m.get("role") == "tool"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_name_is_reported_to_model_not_raised(tmp_path):
+    _init_repo(tmp_path)
+    agent, fake_client = _make_agent(tmp_path, [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "summon_daemon", "arguments": "{}"}}
+            ],
+        },
+        {"role": "assistant", "content": "Sorry, I made that tool up.", "tool_calls": None},
+    ])
+
+    result, pending = await agent.run(
+        task_id="t6", description="use a fake tool", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "completed"
+    assert pending is None
+    # The second turn must have seen the error as this call's tool result.
+    second_turn_messages = fake_client.received[1]
+    error_message = _tool_messages(second_turn_messages)[-1]
+    assert error_message["tool_call_id"] == "call_1"
+    assert error_message["content"].startswith("ERROR:")
+    assert "summon_daemon" in error_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_arguments_are_reported_to_model_not_raised(tmp_path):
+    _init_repo(tmp_path)
+    agent, fake_client = _make_agent(tmp_path, [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "read_file", "arguments": '{"path": '}}
+            ],
+        },
+        {"role": "assistant", "content": "Retrying with valid JSON next time.", "tool_calls": None},
+    ])
+
+    result, pending = await agent.run(
+        task_id="t7", description="send broken args", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "completed"
+    assert pending is None
+    error_message = _tool_messages(fake_client.received[1])[-1]
+    assert error_message["tool_call_id"] == "call_1"
+    assert error_message["content"].startswith("ERROR:")
+
+
+@pytest.mark.asyncio
+async def test_missing_required_argument_is_reported_to_model_not_raised(tmp_path):
+    _init_repo(tmp_path)
+    agent, fake_client = _make_agent(tmp_path, [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}
+            ],
+        },
+        {"role": "assistant", "content": "I forgot the path.", "tool_calls": None},
+    ])
+
+    result, pending = await agent.run(
+        task_id="t8", description="omit an argument", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "completed"
+    assert pending is None
+    error_message = _tool_messages(fake_client.received[1])[-1]
+    assert error_message["content"].startswith("ERROR:")
+
+
+@pytest.mark.asyncio
+async def test_read_file_on_missing_path_is_reported_to_model_not_raised(tmp_path):
+    """Reading a path that does not exist is normal exploration behavior and
+    must let the agent self-correct, not abort the whole run."""
+    _init_repo(tmp_path)
+    agent, fake_client = _make_agent(tmp_path, [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {"name": "read_file", "arguments": '{"path": "nope.txt"}'},
+                }
+            ],
+        },
+        {"role": "assistant", "content": "That file does not exist.", "tool_calls": None},
+    ])
+
+    result, pending = await agent.run(
+        task_id="t9", description="read a missing file", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "completed"
+    assert pending is None
+    error_message = _tool_messages(fake_client.received[1])[-1]
+    assert error_message["tool_call_id"] == "call_1"
+    assert "ERROR:" in error_message["content"]
+    assert "nope.txt" in error_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_pause_in_multi_call_batch_leaves_no_orphan_tool_call_ids(tmp_path):
+    """When the FIRST of two calls needs approval, the second call still needs a
+    tool-role response or the resumed conversation is malformed."""
+    _init_repo(tmp_path)
+    agent, _ = _make_agent(
+        tmp_path,
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "git_commit", "arguments": '{"message": "add notes"}'},
+                    },
+                    {"id": "call_2", "function": {"name": "git_diff", "arguments": "{}"}},
+                ],
+            },
+        ],
+        policy=SafetyPolicy(git_commit="ask"),
+    )
+
+    result, pending = await agent.run(
+        task_id="t10", description="commit then diff", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "pending_approval"
+    assert pending is not None
+    assert pending.tool_call_id == "call_1"
+
+    responded_ids = {m["tool_call_id"] for m in _tool_messages(pending.messages)}
+    assert responded_ids == {"call_1", "call_2"}
+    by_id = {m["tool_call_id"]: m["content"] for m in _tool_messages(pending.messages)}
+    assert by_id["call_1"] == NOT_EXECUTED_MESSAGE
+    assert by_id["call_2"] == NOT_EXECUTED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_calls_before_pause_in_batch_still_execute(tmp_path):
+    """A call preceding the approval-gated one runs for real and gets its
+    genuine result recorded."""
+    _init_repo(tmp_path)
+    agent, _ = _make_agent(
+        tmp_path,
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "README.md"}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "function": {"name": "git_commit", "arguments": '{"message": "wip"}'},
+                    },
+                    {"id": "call_3", "function": {"name": "git_diff", "arguments": "{}"}},
+                ],
+            },
+        ],
+        policy=SafetyPolicy(git_commit="ask"),
+    )
+
+    result, pending = await agent.run(
+        task_id="t11", description="read then commit then diff", model="qwen3-coder-30b-a3b"
+    )
+
+    assert result.status == "pending_approval"
+    assert pending.tool_call_id == "call_2"
+    by_id = {m["tool_call_id"]: m["content"] for m in _tool_messages(pending.messages)}
+    assert set(by_id) == {"call_1", "call_2", "call_3"}
+    assert by_id["call_1"].strip() == "hello"
+    assert by_id["call_2"] == NOT_EXECUTED_MESSAGE
+    assert by_id["call_3"] == NOT_EXECUTED_MESSAGE
