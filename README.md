@@ -133,6 +133,14 @@ cancel_task()
 resume_task()
 ```
 
+Added in Phase 2:
+
+```text
+classify_task()
+```
+
+`classify_task(description)` previews how a description would be classified — returning its task class, disposition (`local` or `claude`), and the keyword that matched — without creating a task or running anything.
+
 Planned for later phases:
 
 ```text
@@ -494,11 +502,35 @@ The repository configuration contains the default settings, including the safety
 
 # Phase 2 — Intelligent Model Routing
 
-**In planning**
+**In progress** — Milestone 1 (task-aware routing) is complete.
 
-Planned capabilities:
+## Milestone 1 — Task Classification ✅ Complete
 
-- Task classification
+Every task is now classified before delegation. Classification is keyword-based and runs first, so a task classified as architecture, security, high-risk, or final review never reaches the router, the registry, or LM Studio — `delegate_task` short-circuits and returns `escalation_recommended`, recommending Claude handle it directly.
+
+Each task class carries a disposition:
+
+- `local` — exploration, implementation, refactoring, testing, debugging, documentation, context
+- `claude` — architecture, security, high_risk, final_review
+
+A description matching both a `claude` and a `local` class resolves to the `claude` class, and a description matching nothing falls back to the `ambiguous` class, which always escalates. Both behaviors are deliberate and fail safe: escalating a borderline task costs tokens, whereas running a security or high-risk change on a local model costs correctness.
+
+The resolved class is persisted as `task_class` on `DelegatedTask` and returned as `task_class` on `TaskResult`, so the routing decision is auditable after the fact. Use `classify_task()` to preview a classification without creating a task.
+
+The keyword table can be replaced in `modelhelm.yaml`:
+
+```yaml
+classification:
+  classes:
+    - name: security
+      disposition: claude
+      keywords: ["security", "auth", "credential", "vulnerability", "encrypt"]
+```
+
+When a `classification:` section is present it replaces the built-in table wholesale rather than merging into it, so a custom table must list every class you want matched. Order matters — classification is first-match-wins in list order, so list `claude`-disposition classes first to preserve the fail-safe. `ambiguous` cannot be redefined: it is the internal fallback and always escalates, and declaring a class by that name is rejected at startup, as is any class with an empty keyword (which would match every description).
+
+Remaining Phase 2 capabilities:
+
 - Model capability detection
 - Hardware-aware routing
 - Deeper `llmfit` integration (beyond fit-score selection)
@@ -725,7 +757,7 @@ Local Repository
 
 The full delegation chain — MCP tool call → router → policy-gated agent loop → LM Studio tool calling → repository edit → human-approved commit — is implemented, tested (109 unit tests + a real end-to-end integration test), and security-reviewed.
 
-**Phase 2 — Intelligent Model Routing: In planning.**
+**Phase 2 — Intelligent Model Routing: Milestone 1 (task-aware routing) complete.** Tasks are classified before delegation, and architecture, security, high-risk and final-review work escalates to Claude instead of reaching a local model.
 
 For the detailed technical requirements and architecture, see:
 

@@ -1008,7 +1008,7 @@ localforge/
 
 - [ ] Integrate llmfit.
 - [ ] Normalize model metadata.
-- [ ] Implement task classification.
+- [x] Implement task classification.
 - [ ] Implement routing engine.
 - [ ] Add configurable routing policies.
 
