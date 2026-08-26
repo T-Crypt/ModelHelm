@@ -74,10 +74,16 @@ class LocalAgent:
         task_id: str,
         description: str,
         model: str,
+        task_class: str,
         resume_messages: list[dict] | None = None,
     ) -> tuple[TaskResult, PendingApproval | None]:
         """Drive the model/tool loop until completion, approval pause, or
         iteration exhaustion.
+
+        ``task_class`` is opaque to this loop -- it is produced by
+        classification upstream (delegate_task) and carried through purely so
+        every TaskResult this run can produce reports which class the task
+        was classified as. LocalAgent makes no routing decisions based on it.
 
         Returns ``(result, pending)``. ``pending`` is non-None only for
         ``status == "pending_approval"``, in which case it carries the
@@ -115,7 +121,7 @@ class LocalAgent:
 
             if not tool_calls:
                 result = self._build_result(
-                    task_id, "completed", model, start_time, iterations,
+                    task_id, "completed", model, task_class, start_time, iterations,
                     message.get("content") or "Task completed.",
                 )
                 return result, None
@@ -182,7 +188,7 @@ class LocalAgent:
             if approval_pause is not None:
                 exc, pending_call_id = approval_pause
                 result = self._build_result(
-                    task_id, "pending_approval", model, start_time, iterations,
+                    task_id, "pending_approval", model, task_class, start_time, iterations,
                     f"Paused: {exc.operation} requires approval ({exc.detail}).",
                 )
                 pending = PendingApproval(
@@ -194,12 +200,12 @@ class LocalAgent:
                 return result, pending
 
         result = self._build_result(
-            task_id, "escalation_recommended", model, start_time, iterations,
+            task_id, "escalation_recommended", model, task_class, start_time, iterations,
             f"Reached max_iterations ({self.agent_config.max_iterations}) without completion.",
         )
         return result, None
 
-    def _build_result(self, task_id, status, model, start_time, iterations, summary) -> TaskResult:
+    def _build_result(self, task_id, status, model, task_class, start_time, iterations, summary) -> TaskResult:
         duration = time.monotonic() - start_time
         # Count against the pre-task baseline so a commit made during the run
         # still counts as changed files (and pre-existing dirt does not).
@@ -222,5 +228,6 @@ class LocalAgent:
             iterations=iterations,
             estimated_cloud_tokens_saved=files_changed * 500,
             review_recommended=status != "completed" or files_changed > 0,
+            task_class=task_class,
             summary=summary,
         )

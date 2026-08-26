@@ -47,7 +47,9 @@ async def test_run_completes_when_model_signals_done_with_no_tool_calls(tmp_path
         agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
     )
 
-    result, pending = await agent.run(task_id="t1", description="no-op task", model="qwen3-coder-30b-a3b")
+    result, pending = await agent.run(
+        task_id="t1", description="no-op task", model="qwen3-coder-30b-a3b", task_class="testing",
+    )
 
     assert result.status == "completed"
     assert result.iterations == 1
@@ -83,7 +85,9 @@ async def test_run_executes_tool_call_then_completes(tmp_path):
         agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
     )
 
-    result, pending = await agent.run(task_id="t2", description="write a note", model="qwen3-coder-30b-a3b")
+    result, pending = await agent.run(
+        task_id="t2", description="write a note", model="qwen3-coder-30b-a3b", task_class="testing",
+    )
 
     assert result.status == "completed"
     assert (tmp_path / "notes.txt").read_text() == "hi"
@@ -110,7 +114,9 @@ async def test_run_stops_at_max_iterations_with_escalation(tmp_path):
         agent_config=AgentConfig(max_iterations=3, test_before_completion=False),
     )
 
-    result, pending = await agent.run(task_id="t3", description="loop forever", model="qwen3-coder-30b-a3b")
+    result, pending = await agent.run(
+        task_id="t3", description="loop forever", model="qwen3-coder-30b-a3b", task_class="testing",
+    )
 
     assert result.status == "escalation_recommended"
     assert result.iterations == 3
@@ -138,7 +144,9 @@ async def test_run_pauses_on_needs_approval(tmp_path):
         agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
     )
 
-    result, pending = await agent.run(task_id="t4", description="commit notes", model="qwen3-coder-30b-a3b")
+    result, pending = await agent.run(
+        task_id="t4", description="commit notes", model="qwen3-coder-30b-a3b", task_class="testing",
+    )
 
     assert result.status == "pending_approval"
     assert "git_commit" in result.summary
@@ -188,7 +196,7 @@ async def test_resume_messages_continues_prior_conversation(tmp_path):
     ]
 
     result, pending = await agent.run(
-        task_id="t5", description="commit notes", model="qwen3-coder-30b-a3b",
+        task_id="t5", description="commit notes", model="qwen3-coder-30b-a3b", task_class="testing",
         resume_messages=prior_messages_with_approved_result,
     )
 
@@ -234,7 +242,8 @@ async def test_files_changed_counts_work_that_was_committed_during_the_run(tmp_p
     )
 
     result, pending = await agent.run(
-        task_id="t12", description="write and commit a note", model="qwen3-coder-30b-a3b"
+        task_id="t12", description="write and commit a note", model="qwen3-coder-30b-a3b",
+        task_class="testing",
     )
 
     assert result.status == "completed"
@@ -263,7 +272,7 @@ async def test_files_changed_excludes_dirt_that_predates_the_task(tmp_path):
     )
 
     result, _ = await agent.run(
-        task_id="t13", description="no-op", model="qwen3-coder-30b-a3b"
+        task_id="t13", description="no-op", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     # The agent changed nothing, so the pre-existing dirt must not be billed to
@@ -303,7 +312,7 @@ async def test_files_changed_counts_agent_work_alongside_preexisting_dirt(tmp_pa
     )
 
     result, _ = await agent.run(
-        task_id="t14", description="write a note", model="qwen3-coder-30b-a3b"
+        task_id="t14", description="write a note", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     assert result.files_changed == 1
@@ -345,7 +354,7 @@ async def test_unknown_tool_name_is_reported_to_model_not_raised(tmp_path):
     ])
 
     result, pending = await agent.run(
-        task_id="t6", description="use a fake tool", model="qwen3-coder-30b-a3b"
+        task_id="t6", description="use a fake tool", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     assert result.status == "completed"
@@ -373,7 +382,7 @@ async def test_malformed_json_arguments_are_reported_to_model_not_raised(tmp_pat
     ])
 
     result, pending = await agent.run(
-        task_id="t7", description="send broken args", model="qwen3-coder-30b-a3b"
+        task_id="t7", description="send broken args", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     assert result.status == "completed"
@@ -398,7 +407,7 @@ async def test_missing_required_argument_is_reported_to_model_not_raised(tmp_pat
     ])
 
     result, pending = await agent.run(
-        task_id="t8", description="omit an argument", model="qwen3-coder-30b-a3b"
+        task_id="t8", description="omit an argument", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     assert result.status == "completed"
@@ -427,7 +436,7 @@ async def test_read_file_on_missing_path_is_reported_to_model_not_raised(tmp_pat
     ])
 
     result, pending = await agent.run(
-        task_id="t9", description="read a missing file", model="qwen3-coder-30b-a3b"
+        task_id="t9", description="read a missing file", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     assert result.status == "completed"
@@ -462,7 +471,7 @@ async def test_pause_in_multi_call_batch_leaves_no_orphan_tool_call_ids(tmp_path
     )
 
     result, pending = await agent.run(
-        task_id="t10", description="commit then diff", model="qwen3-coder-30b-a3b"
+        task_id="t10", description="commit then diff", model="qwen3-coder-30b-a3b", task_class="testing",
     )
 
     assert result.status == "pending_approval"
@@ -504,7 +513,8 @@ async def test_calls_before_pause_in_batch_still_execute(tmp_path):
     )
 
     result, pending = await agent.run(
-        task_id="t11", description="read then commit then diff", model="qwen3-coder-30b-a3b"
+        task_id="t11", description="read then commit then diff", model="qwen3-coder-30b-a3b",
+        task_class="testing",
     )
 
     assert result.status == "pending_approval"
@@ -514,3 +524,25 @@ async def test_calls_before_pause_in_batch_still_execute(tmp_path):
     assert by_id["call_1"].strip() == "hello"
     assert by_id["call_2"] == NOT_EXECUTED_MESSAGE
     assert by_id["call_3"] == NOT_EXECUTED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_task_class_is_threaded_onto_the_result(tmp_path):
+    _init_repo(tmp_path)
+    fake_client = FakeLMStudioClient([
+        {"role": "assistant", "content": "done", "tool_calls": None},
+    ])
+    tools = AgentTools(str(tmp_path), PolicyEngine(SafetyPolicy()))
+    agent = LocalAgent(
+        lmstudio_client=fake_client,
+        tools=tools,
+        git_inspector=GitInspector(str(tmp_path)),
+        agent_config=AgentConfig(max_iterations=8, test_before_completion=False),
+    )
+
+    result, _ = await agent.run(
+        task_id="t-class", description="find the bug", model="qwen3-coder-30b-a3b",
+        task_class="debugging",
+    )
+
+    assert result.task_class == "debugging"
