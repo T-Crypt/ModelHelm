@@ -1,0 +1,27 @@
+modelhelm:
+  default_runtime: lm-studio
+
+runtimes:
+  lm-studio:
+    endpoint: http://localhost:1234
+
+llmfit:
+  binary_path: null
+
+routing:
+  prefer_local: true
+
+safety:
+  file_write: allow
+  file_delete: allow
+  git_commit: ask
+  git_push: ask
+  force_push: deny
+  destructive_commands: deny
+  production_changes: deny
+
+agent:
+  max_iterations: 8
+  # Not yet implemented in Phase 1 (the agent loop does not run tests);
+  # deferred to a later phase.
+  test_before_completion: false

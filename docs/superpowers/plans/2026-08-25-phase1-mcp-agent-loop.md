@@ -1059,7 +1059,7 @@ git commit -m "feat: add git state inspector"
   - `TaskStatus = Literal["pending","running","pending_approval","completed","escalation_recommended","failed","cancelled"]`
   - `class DelegatedTask(BaseModel)` — fields `task_id: str`, `description: str`, `repository: str`, `status: TaskStatus`, `model: str | None`, `created_at: str` (ISO8601)
   - `class TaskResult(BaseModel)` — fields exactly matching spec Section 8: `task_id: str`, `status: TaskStatus`, `model: str`, `runtime: str`, `duration_seconds: float`, `files_changed: int`, `tests_run: int`, `tests_passed: int`, `tests_failed: int`, `iterations: int`, `estimated_cloud_tokens_saved: int`, `review_recommended: bool`, `summary: str`
-  - `class PendingApproval(BaseModel)` — fields `operation: str`, `detail: str`, `tool_call_id: str`, `messages: list[dict]` (the full conversation so far, including the assistant message with the pending tool call) — this is what makes `resume_task` able to continue the *same* conversation instead of starting a fresh one.
+  - `class PendingApproval(BaseModel)` — fields `operation: str`, `detail: str`, `tool_call_id: str`, `messages: list[dict]` (the full conversation so far, including the assistant message with the pending tool call, plus placeholder tool-role replies for the gated call and any later calls in the same batch — see Task 10's implementation for the exact shape) — this is what makes `resume_task` able to continue the *same* conversation instead of starting a fresh one.
 - Produces (`tasks/store.py`):
   - `class TaskStore` — constructor `__init__(self, db_path: str)` (creates schema if missing)
     - `def create_task(self, description: str, repository: str) -> DelegatedTask`
@@ -1738,7 +1738,7 @@ git commit -m "feat: add policy-gated agent tools (file/exec/git)"
   - `AgentConfig` (Task 1)
 - Produces:
   - `class LocalAgent` — constructor `__init__(self, lmstudio_client, tools: AgentTools, git_inspector: GitInspector, agent_config: AgentConfig)`
-    - `async def run(self, task_id: str, description: str, model: str, resume_messages: list[dict] | None = None) -> tuple[TaskResult, PendingApproval | None]` — drives the loop described in spec Section 6. If `resume_messages` is given, the loop continues that conversation instead of starting fresh from `description` (used by `resume_task` in Task 11). On `ToolNeedsApproval`, returns `(TaskResult(status="pending_approval", ...), PendingApproval(...))` where `PendingApproval.messages` is the full conversation up to and including the assistant message that requested the pending tool call — this is what lets `resume_task` continue the *same* conversation rather than starting over (a fresh restart would just hit the same approval gate again, since the model has no memory of already being denied). On any other terminal status the second tuple element is `None`.
+    - `async def run(self, task_id: str, description: str, model: str, resume_messages: list[dict] | None = None) -> tuple[TaskResult, PendingApproval | None]` — drives the loop described in spec Section 6. If `resume_messages` is given, the loop continues that conversation instead of starting fresh from `description` (used by `resume_task` in Task 11). On `ToolNeedsApproval`, the loop finishes walking the rest of that turn's tool-call batch (appending a placeholder tool-role reply for the gated call and any later calls in the batch, so every `tool_call_id` in the assistant turn has a response) before returning `(TaskResult(status="pending_approval", ...), PendingApproval(...))`. `PendingApproval.messages` is therefore always a valid, resendable conversation — this is what lets `resume_task` continue the *same* conversation rather than starting over (a fresh restart would just hit the same approval gate again, since the model has no memory of already being denied). On any other terminal status the second tuple element is `None`.
 
 To keep this task self-contained and testable without a real LLM, `LocalAgent.run` takes the chat loop's tool-call decisions from `lmstudio_client.chat_completion`, which is fully mocked in this task's tests (real end-to-end behavior is verified in Task 12's integration test).
 
@@ -2043,7 +2043,7 @@ class LocalAgent:
         )
 ```
 
-**Resume mechanics note:** when `resume_task` (Task 11) re-invokes `run` with `resume_messages` set, the *last* message in that list is the assistant message containing the pending tool call. On resume, the policy for the pending operation has been elevated to `"allow"` for that one call (Task 11 handles this by re-executing the tool call directly — not by relying on the model to re-request it, since a model replaying the same `tool_calls` message would otherwise hit `ToolNeedsApproval` again through the normal dispatch path). Concretely, Task 11's `resume_task` executes the approved tool call itself using `PendingApproval.tool_call_id`, appends the resulting `{"role": "tool", ...}` message, and only then calls `agent.run(..., resume_messages=messages_with_tool_result_appended)` so the loop continues from a state where the model already sees its tool call succeeded.
+**Resume mechanics note (updated during Task 10's fix loop — see Task 11 for the corrected consumer contract):** when a tool call needs approval, the agent loop does not return immediately — it finishes walking the rest of that turn's tool-call batch first, appending a `NOT_EXECUTED_MESSAGE` placeholder tool-role reply for the gated call and for any calls after it in the same batch (calls *before* the gated one still execute for real). Only once the full batch has a tool-role reply for every `tool_call_id` — real result or placeholder — is `PendingApproval` built. This means `pending.messages` is always a *valid, resendable* conversation (every `tool_call_id` from the assistant turn has some tool-role response), but the gated call's placeholder is not guaranteed to be the last message in a multi-call batch. On resume, Task 11's `resume_task` executes the approved tool call itself using `PendingApproval.tool_call_id`, then finds the assistant message whose `tool_calls` includes that id (to recover the call's arguments) and **replaces** — never appends after — the matching placeholder tool-role message's content with the real result, before calling `agent.run(..., resume_messages=<messages with the placeholder replaced>)`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -2074,7 +2074,7 @@ git commit -m "feat: add local agent execution loop with escalation and approval
   - `delegate_task(description: str, repository: str) -> dict` — creates a task, runs `LocalAgent.run`, persists result (and `PendingApproval` if any), returns serialized `TaskResult`
   - `get_task_status(task_id: str) -> dict` — serialized `DelegatedTask`, 404-style `{"error": "not found"}` dict if missing
   - `cancel_task(task_id: str) -> dict` — sets status to `"cancelled"`, returns updated task
-  - `resume_task(task_id: str, approved: bool) -> dict` — Phase 1 semantics: looks up the task's `PendingApproval` via `task_store.get_pending_approval(task_id)`; if missing, returns `{"error": "no pending approval for this task"}`. If `approved=False`, sets status `"cancelled"` and returns the task. If `approved=True`: directly executes the approved operation via `AgentTools` (bypassing the policy engine for this one call, since the human already approved it out-of-band), appends a `{"role": "tool", "tool_call_id": ..., "content": ...}` message to `pending.messages`, then calls `LocalAgent.run(..., resume_messages=<extended messages>)` to continue the same conversation. This correctly unblocks exactly the one pending step; if the model requests another gated operation afterward, a new `PendingApproval` is saved and `resume_task` must be called again (multi-step approval chains are handled by repeated resume calls, not a single call — documented as a Phase 1 limitation, not a bug, since each step still gets independent human sign-off).
+  - `resume_task(task_id: str, approved: bool) -> dict` — Phase 1 semantics: looks up the task's `PendingApproval` via `task_store.get_pending_approval(task_id)`; if missing, returns `{"error": "no pending approval for this task"}`. If `approved=False`, sets status `"cancelled"` and returns the task. If `approved=True`: directly executes the approved operation via `AgentTools` (bypassing the policy engine for this one call, since the human already approved it out-of-band), then **replaces** (not appends) the placeholder tool-role message for `pending.tool_call_id` inside `pending.messages` with the real result. **Important — corrected during Task 10's fix loop:** `pending.messages` no longer necessarily ends with the assistant message that requested the pending call. Task 10's agent loop now appends a `NOT_EXECUTED_MESSAGE` placeholder tool-role reply for the gated call (and for any other tool calls in the same batch that come after it) at construction time, so every `tool_call_id` in that assistant turn already has *some* tool-role response — this is required for the conversation to be valid to resend to an OpenAI-compatible API. Locate the message to replace by scanning `pending.messages` for `{"role": "tool", "tool_call_id": pending.tool_call_id, ...}` (it is NOT guaranteed to be the last message — in a multi-call batch it can be anywhere after the assistant turn) and overwrite its `"content"` with the real tool result string. Then call `LocalAgent.run(..., resume_messages=<messages with that one placeholder replaced>)` to continue the same conversation. This correctly unblocks exactly the one pending step; if the model requests another gated operation afterward, a new `PendingApproval` is saved and `resume_task` must be called again (multi-step approval chains are handled by repeated resume calls, not a single call — documented as a Phase 1 limitation, not a bug, since each step still gets independent human sign-off).
 
 This task wires everything together behind module-level singletons constructed from `load_settings()`, matching the standard MCP Python SDK `FastMCP` pattern (`from mcp.server.fastmcp import FastMCP`, `@mcp.tool()` decorators, `mcp.run()` in `if __name__ == "__main__"`).
 
@@ -2192,6 +2192,11 @@ async def test_resume_task_approved_executes_pending_commit_and_continues(server
                     {"id": "call_1", "function": {"name": "git_commit", "arguments": '{"message": "add notes"}'}}
                 ],
             },
+            # Task 10's agent loop always appends a placeholder tool-role reply
+            # for the gated call before building PendingApproval (so every
+            # tool_call_id in the assistant turn has a response) — resume_task
+            # must replace this placeholder's content, not append after it.
+            {"role": "tool", "tool_call_id": "call_1", "content": "not executed: run paused pending approval"},
         ],
     )
     server.task_store.save_pending_approval(task.task_id, pending)
@@ -2325,13 +2330,33 @@ def create_server(
         # it directly with an elevated one-off policy rather than routing back
         # through the normal ask-gated AgentTools methods (which would just raise
         # ToolNeedsApproval again).
+        #
+        # pending.messages does NOT necessarily end with the assistant message
+        # that requested the gated call (Task 10's agent loop appends a
+        # NOT_EXECUTED_MESSAGE placeholder tool-role reply for the gated call,
+        # and for any later calls in the same batch, so every tool_call_id in
+        # that assistant turn already has a tool-role response — required for
+        # the conversation to be valid to resend). So: find the assistant
+        # message whose tool_calls include pending.tool_call_id to recover the
+        # call's arguments, and find-and-replace (never append) the matching
+        # placeholder tool-role message with the real result.
+        pending_call = next(
+            call
+            for message in pending.messages
+            if message.get("role") == "assistant" and message.get("tool_calls")
+            for call in message["tool_calls"]
+            if call["id"] == pending.tool_call_id
+        )
         elevated_policy = settings.safety.model_copy(update={pending.operation: "allow"})
         agent_tools = AgentTools(task.repository, PolicyEngine(elevated_policy))
         tool_result = TOOL_DISPATCH[pending.operation](
-            agent_tools, json.loads(pending.messages[-1]["tool_calls"][0]["function"]["arguments"])
+            agent_tools, json.loads(pending_call["function"]["arguments"])
         )
-        extended_messages = pending.messages + [
-            {"role": "tool", "tool_call_id": pending.tool_call_id, "content": str(tool_result)}
+        extended_messages = [
+            {**m, "content": str(tool_result)}
+            if m.get("role") == "tool" and m.get("tool_call_id") == pending.tool_call_id
+            else m
+            for m in pending.messages
         ]
 
         git_inspector = GitInspector(task.repository)
