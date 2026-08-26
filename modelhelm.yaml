@@ -25,3 +25,44 @@ agent:
   # Not yet implemented in Phase 1 (the agent loop does not run tests);
   # deferred to a later phase.
   test_before_completion: false
+
+# Task classification table used by delegate_task's routing gate. Classes
+# listed here REPLACE the built-in default table entirely (not merged).
+# Omit this section to use the built-in 11-class table.
+# The "ambiguous" fallback (disposition: claude) is not configurable and
+# is not listed here -- it fires automatically when no class matches.
+classification:
+  classes:
+    - name: exploration
+      disposition: local
+      keywords: [find, explore, search, inspect, locate, "where is"]
+    - name: implementation
+      disposition: local
+      keywords: [implement, add, build, create]
+    - name: refactoring
+      disposition: local
+      keywords: [refactor, rename, "clean up", restructure]
+    - name: testing
+      disposition: local
+      keywords: [test, "write tests", "add coverage", "unit test"]
+    - name: debugging
+      disposition: local
+      keywords: [debug, "fix bug", "investigate error", "why is", broken]
+    - name: documentation
+      disposition: local
+      keywords: [document, readme, docstring, "add comments"]
+    - name: context
+      disposition: local
+      keywords: [summarize, "update context", memory]
+    - name: architecture
+      disposition: claude
+      keywords: [architecture, "design the system", redesign, "system design"]
+    - name: security
+      disposition: claude
+      keywords: [security, auth, credential, vulnerability, encrypt]
+    - name: high_risk
+      disposition: claude
+      keywords: [production, delete, "drop table", "force push", "migrate database"]
+    - name: final_review
+      disposition: claude
+      keywords: ["review this", "final review", "review the implementation"]

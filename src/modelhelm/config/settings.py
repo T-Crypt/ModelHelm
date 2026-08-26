@@ -3,6 +3,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel
 
+from modelhelm.classification.classifier import TaskClass, DEFAULT_TASK_CLASSES
+
 PolicyState = Literal["allow", "deny", "ask"]
 
 class SafetyPolicy(BaseModel):
@@ -25,6 +27,9 @@ class AgentConfig(BaseModel):
 class LMStudioConfig(BaseModel):
     endpoint: str = "http://localhost:1234"
 
+class ClassificationConfig(BaseModel):
+    classes: list[TaskClass] = DEFAULT_TASK_CLASSES
+
 class Settings(BaseModel):
     default_runtime: str = "lm-studio"
     lm_studio: LMStudioConfig = LMStudioConfig()
@@ -32,6 +37,7 @@ class Settings(BaseModel):
     prefer_local: bool = True
     safety: SafetyPolicy = SafetyPolicy()
     agent: AgentConfig = AgentConfig()
+    classification: ClassificationConfig = ClassificationConfig()
 
 def load_settings(path: str | None = None) -> Settings:
     config_path = Path(path) if path else Path.cwd() / "modelhelm.yaml"
@@ -39,6 +45,12 @@ def load_settings(path: str | None = None) -> Settings:
         return Settings()
 
     raw = yaml.safe_load(config_path.read_text()) or {}
+    classification_raw = raw.get("classification", {}).get("classes")
+    classification = (
+        ClassificationConfig(classes=[TaskClass(**c) for c in classification_raw])
+        if classification_raw is not None
+        else ClassificationConfig()
+    )
     return Settings(
         default_runtime=raw.get("modelhelm", {}).get("default_runtime", "lm-studio"),
         lm_studio=LMStudioConfig(
@@ -50,4 +62,5 @@ def load_settings(path: str | None = None) -> Settings:
         prefer_local=raw.get("routing", {}).get("prefer_local", True),
         safety=SafetyPolicy(**raw.get("safety", {})),
         agent=AgentConfig(**raw.get("agent", {})),
+        classification=classification,
     )

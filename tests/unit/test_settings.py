@@ -1,6 +1,7 @@
 import textwrap
 from pathlib import Path
 from modelhelm.config.settings import load_settings, Settings
+from modelhelm.classification.classifier import DEFAULT_TASK_CLASSES, load_classifier
 
 def test_load_settings_from_file(tmp_path):
     config_path = tmp_path / "modelhelm.yaml"
@@ -48,3 +49,35 @@ def test_shipped_config_does_not_enable_test_before_completion():
     repo_config = Path(__file__).resolve().parents[2] / "modelhelm.yaml"
     settings = load_settings(str(repo_config))
     assert settings.agent.test_before_completion is False
+
+def test_load_settings_defaults_to_builtin_classification_table():
+    settings = Settings()
+    assert settings.classification.classes == DEFAULT_TASK_CLASSES
+
+def test_load_settings_with_custom_classification_replaces_default_table(tmp_path):
+    config_path = tmp_path / "modelhelm.yaml"
+    config_path.write_text(textwrap.dedent("""
+        classification:
+          classes:
+            - name: only_class
+              disposition: claude
+              keywords: [banana]
+    """))
+    settings = load_settings(str(config_path))
+    assert len(settings.classification.classes) == 1
+    assert settings.classification.classes[0].name == "only_class"
+
+def test_load_settings_without_classification_section_uses_default_table(tmp_path):
+    config_path = tmp_path / "modelhelm.yaml"
+    config_path.write_text(textwrap.dedent("""
+        modelhelm:
+          default_runtime: lm-studio
+    """))
+    settings = load_settings(str(config_path))
+    assert settings.classification.classes == DEFAULT_TASK_CLASSES
+
+def test_load_classifier_builds_from_settings():
+    settings = Settings()
+    classifier = load_classifier(settings)
+    result = classifier.classify("find the login handler")
+    assert result.task_class == "exploration"

@@ -67,3 +67,12 @@ class TaskClassifier:
         return ClassificationResult(
             task_class="ambiguous", disposition="claude", matched_keyword=None
         )
+
+def load_classifier(settings) -> TaskClassifier:
+    """Builds a TaskClassifier from settings.classification.classes.
+
+    `settings` is left untyped here (no `Settings` import) to avoid a
+    circular import, since `config/settings.py` already imports from this
+    module.
+    """
+    return TaskClassifier(settings.classification.classes)
