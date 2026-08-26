@@ -215,6 +215,35 @@ class TaskResult(BaseModel):
     task_class: str  # new, required — always populated, even for local runs
 ```
 
+**Persistence and resume.** `LocalAgent` has no knowledge of classification —
+it stays a pure tool-calling loop, per the Section 5 architecture split.
+This means `task_class` must be computed once by `delegate_task` and
+threaded through two paths that both eventually build a `TaskResult`:
+
+1. **First delegation** (`delegate_task`): classify → pass `task_class` into
+   `LocalAgent.run(..., task_class=classification.task_class)` → `run()`
+   forwards it to every `_build_result()` call so it lands on every
+   `TaskResult` this run can produce (`completed`, `pending_approval`,
+   `escalation_recommended`).
+2. **Resume** (`resume_task`): no re-classification happens — the task was
+   already classified once, and re-running the classifier on resume could
+   theoretically disagree with the original classification (the persisted
+   conversation already reflects the original one). `DelegatedTask` (Task
+   7's `tasks/models.py`) therefore gains a `task_class: str | None = None`
+   field, persisted alongside `model` when `delegate_task` first calls
+   `task_store.set_status`. `resume_task` reads `task.task_class` back and
+   passes it into `agent.run(..., task_class=task.task_class)` the same way.
+
+`TaskStore.create_task` (Task 7's `tasks/store.py`) gains a `task_class`
+parameter (nullable, since it's set right after classification, not at
+creation), and the `tasks` table gains a `task_class TEXT` column.
+`set_status` gains an optional `task_class` parameter alongside its
+existing optional `model` parameter, following the same pattern.
+
+`LocalAgent.run()` and `_build_result()` (Task 10's `agents/local_agent.py`)
+both gain a `task_class: str` parameter — required, not optional, so a
+caller can never accidentally construct a `TaskResult` missing it.
+
 MCP server (`mcp/server.py`) gains one new tool and modifies `delegate_task`:
 
 ```python
@@ -249,8 +278,27 @@ async def delegate_task(description: str, repository: str) -> dict:
         task_store.save_result(task.task_id, result)
         return result.model_dump()
 
-    # ...existing local-delegation flow, unchanged, with
-    # task_class=classification.task_class threaded into the final TaskResult...
+    # Existing Phase 1 flow, with task_class threaded through:
+    try:
+        model = await router.select_model(description)
+    except NoSuitableModelError as exc:
+        task_store.set_status(task.task_id, "failed")
+        return {"task_id": task.task_id, "status": "failed", "summary": str(exc)}
+
+    task_store.set_status(task.task_id, "running", model=model, task_class=classification.task_class)
+    try:
+        # ...construct policy_engine, agent_tools, git_inspector, agent (unchanged)...
+        result, pending = await agent.run(
+            task_id=task.task_id, description=description, model=model,
+            task_class=classification.task_class,
+        )
+        task_store.set_status(task.task_id, result.status, model=model)
+        task_store.save_result(task.task_id, result)
+        if pending is not None:
+            task_store.save_pending_approval(task.task_id, pending)
+        return result.model_dump()
+    except Exception as exc:
+        # ...unchanged failure handling...
 ```
 
 `model="none"` / `runtime="none"` on the escalation-recommended path: no
@@ -259,6 +307,13 @@ called. This is a deliberate, explicit sentinel rather than leaving the
 fields empty or omitting them — `TaskResult`'s fields are otherwise all
 required (per Phase 1's spec), so this milestone keeps that invariant
 rather than making them optional.
+
+`resume_task` (unchanged control flow, one new line): after fetching
+`task = task_store.get_task(task_id)`, it now also has `task.task_class`
+available (persisted at first delegation) and passes it through the same
+way: `agent.run(..., task_class=task.task_class)`. No re-classification
+happens on resume — the original classification is authoritative for the
+life of the task, since the persisted conversation already reflects it.
 
 ## 7. Testing
 
