@@ -186,6 +186,27 @@ def create_server(
         if pending is None:
             return {"error": "no pending approval for this task"}
 
+        # Validate task_class BEFORE executing the approved call. There is no
+        # re-classification on resume -- the class persisted at delegation time
+        # is authoritative -- so a None here means the task predates this
+        # milestone's schema or was created outside delegate_task. agent.run()
+        # would eventually reject it when constructing TaskResult, but only
+        # AFTER the approved side effect (a file write, a commit) had already
+        # landed; the resulting ValidationError was then swallowed by the broad
+        # except below, and delete_pending_approval was never reached, leaving
+        # the approval replayable against now-stale arguments.
+        #
+        # The approval record is deliberately left in place: nothing was
+        # executed, so there is no consumed approval to retire, and preserving
+        # it lets a legitimate retry succeed once the missing task_class is
+        # repaired rather than forcing the human to re-approve from scratch.
+        if task.task_class is None:
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "error": "task_class is missing on this task; cannot resume",
+            }
+
         # The human already approved this exact operation out-of-band, so execute
         # it directly with an elevated one-off policy rather than routing back
         # through the normal ask-gated AgentTools methods (which would just raise
@@ -234,9 +255,8 @@ def create_server(
                 agent_config=settings.agent,
             )
             # No re-classification on resume: the class persisted at delegation
-            # time is authoritative. A None here means delegate_task never
-            # persisted one, which is a bug — let agent.run() raise loudly
-            # rather than papering over it with a default.
+            # time is authoritative. It is guaranteed non-None by the early
+            # guard above, which rejects the resume before any side effect.
             result, new_pending = await agent.run(
                 task_id=task.task_id, description=task.description, model=task.model,
                 task_class=task.task_class,
