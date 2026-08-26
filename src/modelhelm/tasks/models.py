@@ -19,6 +19,7 @@ class DelegatedTask(BaseModel):
     repository: str
     status: TaskStatus
     model: str | None = None
+    task_class: str | None = None
     created_at: str
 
 
@@ -35,6 +36,7 @@ class TaskResult(BaseModel):
     iterations: int
     estimated_cloud_tokens_saved: int
     review_recommended: bool
+    task_class: str
     summary: str
 
 

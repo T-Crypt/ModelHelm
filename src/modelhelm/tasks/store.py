@@ -24,6 +24,7 @@ class TaskStore:
                     repository TEXT NOT NULL,
                     status TEXT NOT NULL,
                     model TEXT,
+                    task_class TEXT,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -54,20 +55,22 @@ class TaskStore:
             repository=repository,
             status="pending",
             model=None,
+            task_class=None,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO tasks (task_id, description, repository, status, model, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (task.task_id, task.description, task.repository, task.status, task.model, task.created_at),
+                "INSERT INTO tasks (task_id, description, repository, status, model, task_class, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task.task_id, task.description, task.repository, task.status,
+                 task.model, task.task_class, task.created_at),
             )
         return task
 
     def get_task(self, task_id: str) -> DelegatedTask | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT task_id, description, repository, status, model, created_at "
+                "SELECT task_id, description, repository, status, model, task_class, created_at "
                 "FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
@@ -79,15 +82,28 @@ class TaskStore:
             repository=row[2],
             status=row[3],
             model=row[4],
-            created_at=row[5],
+            task_class=row[5],
+            created_at=row[6],
         )
 
-    def set_status(self, task_id: str, status: TaskStatus, model: str | None = None) -> None:
+    def set_status(
+        self, task_id: str, status: TaskStatus, model: str | None = None, task_class: str | None = None
+    ) -> None:
         with self._connect() as conn:
-            if model is not None:
+            if model is not None and task_class is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, model = ?, task_class = ? WHERE task_id = ?",
+                    (status, model, task_class, task_id),
+                )
+            elif model is not None:
                 conn.execute(
                     "UPDATE tasks SET status = ?, model = ? WHERE task_id = ?",
                     (status, model, task_id),
+                )
+            elif task_class is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, task_class = ? WHERE task_id = ?",
+                    (status, task_class, task_id),
                 )
             else:
                 conn.execute(

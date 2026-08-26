@@ -41,12 +41,40 @@ def test_save_and_get_result(tmp_path):
         iterations=3,
         estimated_cloud_tokens_saved=18400,
         review_recommended=True,
+        task_class="implementation",
         summary="Implemented auth.",
     )
     store.save_result(task.task_id, result)
 
     fetched = store.get_result(task.task_id)
     assert fetched == result
+
+
+def test_create_task_starts_with_no_task_class(tmp_path):
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    task = store.create_task(description="add auth", repository="/repo")
+    assert task.task_class is None
+
+
+def test_set_status_with_task_class_persists_it(tmp_path):
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    task = store.create_task(description="add auth", repository="/repo")
+
+    store.set_status(task.task_id, "running", model="qwen3-coder-30b-a3b", task_class="implementation")
+    fetched = store.get_task(task.task_id)
+
+    assert fetched.task_class == "implementation"
+
+
+def test_set_status_without_task_class_leaves_existing_value(tmp_path):
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    task = store.create_task(description="add auth", repository="/repo")
+    store.set_status(task.task_id, "running", model="x", task_class="implementation")
+
+    store.set_status(task.task_id, "completed")  # no task_class passed
+    fetched = store.get_task(task.task_id)
+
+    assert fetched.task_class == "implementation"
 
 
 def test_get_task_returns_none_for_unknown_id(tmp_path):
