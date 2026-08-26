@@ -81,3 +81,33 @@ def test_load_classifier_builds_from_settings():
     classifier = load_classifier(settings)
     result = classifier.classify("find the login handler")
     assert result.task_class == "exploration"
+
+
+# --- C1: the shipped modelhelm.yaml must not undo the safe ordering ---------
+# A present classification: section REPLACES the built-in table wholesale, so
+# the repo config is what actually governs a real run. It shipped in the old
+# local-first order, which silently defeated the in-code reorder; no test
+# caught it because every other test builds Settings() directly.
+
+REPO_CONFIG = Path(__file__).resolve().parents[2] / "modelhelm.yaml"
+
+
+def test_repo_config_lists_claude_classes_before_local_ones():
+    classes = load_settings(str(REPO_CONFIG)).classification.classes
+    dispositions = [c.disposition for c in classes]
+    assert dispositions == sorted(dispositions, key=lambda d: d != "claude"), (
+        "claude-disposition classes must precede local ones in modelhelm.yaml"
+    )
+
+
+def test_repo_config_matches_the_builtin_default_table():
+    """The shipped config is meant to be the defaults written out explicitly;
+    drift between the two is how the C1 misrouting survived the code fix."""
+    assert load_settings(str(REPO_CONFIG)).classification.classes == DEFAULT_TASK_CLASSES
+
+
+def test_repo_config_escalates_realistic_security_description():
+    classifier = load_classifier(load_settings(str(REPO_CONFIG)))
+    result = classifier.classify("Add OAuth2 authentication to the login endpoint")
+    assert result.task_class == "security"
+    assert result.disposition == "claude"

@@ -411,10 +411,147 @@ async def test_delegate_task_persists_escalation_result(server, tmp_path):
 
     task_status = await server.tools["get_task_status"](task_id=result["task_id"])
     assert task_status["status"] == "escalation_recommended"
-    # "security" (via the "security" keyword) beats "final_review" (via
-    # "review this") because security is earlier in DEFAULT_TASK_CLASSES
-    # table order.
+    # Both candidates here are claude-disposition, so the C1 local/claude
+    # group swap does not affect this case: "security" (via the "security"
+    # keyword) still beats "final_review" (via "review this") because security
+    # precedes final_review within the claude group, and their relative order
+    # was left unchanged.
     assert task_status["task_class"] == "security"
+
+
+# --- C2: a missing task_class must fail before any side effect --------------
+
+@pytest.mark.asyncio
+async def test_resume_task_with_missing_task_class_fails_without_side_effect(tmp_path):
+    """A task whose task_class is None (pre-milestone schema, or created
+    outside delegate_task) must be rejected BEFORE the approved tool call runs.
+
+    Previously the write landed first, then agent.run() raised a Pydantic
+    ValidationError building TaskResult; the broad except turned that into a
+    generic failure and never reached delete_pending_approval, leaving a
+    replayable approval alongside an already-applied side effect.
+    """
+    import subprocess
+    from modelhelm.tasks.models import PendingApproval
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+
+    settings = Settings(
+        safety=SafetyPolicy(file_write="ask"),
+        agent=AgentConfig(max_iterations=2, test_before_completion=False),
+    )
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    server = create_server(
+        settings=settings,
+        task_store=store,
+        lmstudio_client=FakeLMStudioClient(),
+        llmfit_client=FakeLlmfitClient(),
+    )
+
+    task = store.create_task(description="write notes", repository=str(repo))
+    # Deliberately no task_class= here: this is the reviewer's exact scenario.
+    store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    assert store.get_task(task.task_id).task_class is None
+
+    store.save_pending_approval(
+        task.task_id,
+        PendingApproval(
+            operation="file_write",
+            detail="write to notes.txt",
+            tool_call_id="call_1",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "notes.txt", "content": "agent version"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "not executed"},
+            ],
+        ),
+    )
+
+    result = await server.tools["resume_task"](task_id=task.task_id, approved=True)
+
+    # (a) a structured failure that names the actual cause, not a ValidationError
+    assert result["status"] == "failed"
+    assert result["task_id"] == task.task_id
+    assert "task_class is missing" in result["error"]
+
+    # (b) the approved side effect did NOT happen
+    assert not (repo / "notes.txt").exists()
+
+    # (c) nothing was silently consumed: the approval survives for a legitimate
+    # retry once the missing task_class is repaired.
+    assert store.get_pending_approval(task.task_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_task_succeeds_once_missing_task_class_is_repaired(tmp_path):
+    """The C2 guard must be a genuine precondition check, not a dead end: after
+    the task_class is set, the preserved approval resumes normally."""
+    import subprocess
+    from modelhelm.tasks.models import PendingApproval
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    server = create_server(
+        settings=Settings(
+            safety=SafetyPolicy(file_write="ask"),
+            agent=AgentConfig(max_iterations=2, test_before_completion=False),
+        ),
+        task_store=store,
+        lmstudio_client=FakeLMStudioClient(),
+        llmfit_client=FakeLlmfitClient(),
+    )
+
+    task = store.create_task(description="write notes", repository=str(repo))
+    store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    store.save_pending_approval(
+        task.task_id,
+        PendingApproval(
+            operation="file_write",
+            detail="write to notes.txt",
+            tool_call_id="call_1",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "notes.txt", "content": "hello"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "not executed"},
+            ],
+        ),
+    )
+
+    assert (await server.tools["resume_task"](task_id=task.task_id, approved=True))["status"] == "failed"
+
+    store.set_status(task.task_id, "pending_approval", task_class="implementation")
+    result = await server.tools["resume_task"](task_id=task.task_id, approved=True)
+
+    assert result["status"] == "completed"
+    assert (repo / "notes.txt").read_text() == "hello"
+    assert store.get_pending_approval(task.task_id) is None
 
 
 @pytest.mark.asyncio
