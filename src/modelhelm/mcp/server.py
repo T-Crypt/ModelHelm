@@ -2,7 +2,7 @@
 
 This module is the integration point: it constructs the model registry,
 router, policy engine, task store and agent loop from a ``Settings`` object
-and publishes seven tools over MCP.
+and publishes eight tools over MCP.
 
 ``create_server`` is a factory rather than module-level state so tests (and
 alternative front ends) can inject fakes for the two external dependencies
@@ -19,7 +19,9 @@ import shutil
 
 from mcp.server.mcpserver import MCPServer
 
+from modelhelm.classification.classifier import load_classifier
 from modelhelm.config.settings import Settings, load_settings
+from modelhelm.tasks.models import TaskResult
 from modelhelm.runtimes.lmstudio import LMStudioClient
 from modelhelm.models.llmfit_client import LlmfitClient, LlmfitError
 from modelhelm.models.registry import ModelRegistry
@@ -49,6 +51,7 @@ def create_server(
     mcp = MCPServer("modelhelm")
     registry = ModelRegistry(lmstudio_client=lmstudio_client, llmfit_client=llmfit_client)
     router = TaskRouter(registry)
+    classifier = load_classifier(settings)
 
     async def get_status() -> dict:
         try:
@@ -74,15 +77,52 @@ def create_server(
     async def recommend_model(task_description: str) -> str:
         return await router.select_model(task_description)
 
+    async def classify_task(description: str) -> dict:
+        """Preview a description's task class without creating or touching a task."""
+        return classifier.classify(description).model_dump()
+
     async def delegate_task(description: str, repository: str) -> dict:
+        # Classification happens before anything else: a claude-disposition task
+        # must never reach the router, the registry, or LM Studio, so the
+        # short-circuit below has to precede router.select_model().
+        classification = classifier.classify(description)
         task = task_store.create_task(description=description, repository=repository)
+
+        if classification.disposition == "claude":
+            task_store.set_status(
+                task.task_id, "escalation_recommended", task_class=classification.task_class
+            )
+            result = TaskResult(
+                task_id=task.task_id,
+                status="escalation_recommended",
+                model="none",
+                runtime="none",
+                duration_seconds=0.0,
+                files_changed=0,
+                tests_run=0,
+                tests_passed=0,
+                tests_failed=0,
+                iterations=0,
+                estimated_cloud_tokens_saved=0,
+                review_recommended=True,
+                task_class=classification.task_class,
+                summary=(
+                    f"Classified as {classification.task_class} — "
+                    f"recommend Claude handle this directly."
+                ),
+            )
+            task_store.save_result(task.task_id, result)
+            return result.model_dump()
+
         try:
             model = await router.select_model(description)
         except NoSuitableModelError as exc:
-            task_store.set_status(task.task_id, "failed")
+            task_store.set_status(task.task_id, "failed", task_class=classification.task_class)
             return {"task_id": task.task_id, "status": "failed", "summary": str(exc)}
 
-        task_store.set_status(task.task_id, "running", model=model)
+        task_store.set_status(
+            task.task_id, "running", model=model, task_class=classification.task_class
+        )
         # Safety net: anything the agent loop can raise (PathScopeError,
         # ToolDenied, subprocess failures, an httpx timeout talking to LM
         # Studio) must become a structured failure. Letting it propagate out of
@@ -99,7 +139,8 @@ def create_server(
                 agent_config=settings.agent,
             )
             result, pending = await agent.run(
-                task_id=task.task_id, description=description, model=model
+                task_id=task.task_id, description=description, model=model,
+                task_class=classification.task_class,
             )
             task_store.set_status(task.task_id, result.status, model=model)
             task_store.save_result(task.task_id, result)
@@ -192,8 +233,13 @@ def create_server(
                 git_inspector=git_inspector,
                 agent_config=settings.agent,
             )
+            # No re-classification on resume: the class persisted at delegation
+            # time is authoritative. A None here means delegate_task never
+            # persisted one, which is a bug — let agent.run() raise loudly
+            # rather than papering over it with a default.
             result, new_pending = await agent.run(
                 task_id=task.task_id, description=task.description, model=task.model,
+                task_class=task.task_class,
                 resume_messages=extended_messages,
             )
             task_store.set_status(task.task_id, result.status, model=task.model)
@@ -218,6 +264,7 @@ def create_server(
         "get_status": get_status,
         "list_models": list_models,
         "recommend_model": recommend_model,
+        "classify_task": classify_task,
         "delegate_task": delegate_task,
         "get_task_status": get_task_status,
         "cancel_task": cancel_task,

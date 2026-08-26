@@ -48,11 +48,14 @@ async def test_delegate_task_and_get_status(server, tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"], check=True, capture_output=True)
 
-    result = await server.tools["delegate_task"](description="no-op", repository=str(tmp_path))
+    result = await server.tools["delegate_task"](description="implement a no-op change", repository=str(tmp_path))
+    # "implement" matches the implementation class -> local, same as before this milestone.
     assert result["status"] == "completed"
+    assert result["task_class"] == "implementation"
 
     task_status = await server.tools["get_task_status"](task_id=result["task_id"])
     assert task_status["status"] == "completed"
+    assert task_status["task_class"] == "implementation"
 
 @pytest.mark.asyncio
 async def test_get_task_status_unknown_returns_error(server):
@@ -91,7 +94,11 @@ async def test_resume_task_approved_executes_pending_commit_and_continues(server
     (tmp_path / "notes.txt").write_text("updated")
 
     task = server.task_store.create_task(description="commit notes", repository=str(tmp_path))
-    server.task_store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    # resume_task threads task.task_class into agent.run(), which requires a str;
+    # this fixture bypasses delegate_task, so the class must be set explicitly.
+    server.task_store.set_status(
+        task.task_id, "pending_approval", model="qwen3-coder-30b-a3b", task_class="testing"
+    )
     pending = PendingApproval(
         operation="git_commit",
         detail="add notes",
@@ -154,7 +161,9 @@ async def test_resume_task_approved_executes_pending_file_write(tmp_path):
     )
 
     task = store.create_task(description="write notes", repository=str(repo))
-    store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    store.set_status(
+        task.task_id, "pending_approval", model="qwen3-coder-30b-a3b", task_class="testing"
+    )
     store.save_pending_approval(
         task.task_id,
         PendingApproval(
@@ -206,7 +215,9 @@ async def test_second_resume_does_not_replay_the_approved_operation(server, tmp_
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"], check=True, capture_output=True)
 
     task = server.task_store.create_task(description="write notes", repository=str(tmp_path))
-    server.task_store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    server.task_store.set_status(
+        task.task_id, "pending_approval", model="qwen3-coder-30b-a3b", task_class="testing"
+    )
     server.task_store.save_pending_approval(
         task.task_id,
         PendingApproval(
@@ -279,7 +290,7 @@ async def test_delegate_task_returns_failed_dict_on_lmstudio_timeout(tmp_path):
         llmfit_client=FakeLlmfitClient(),
     )
 
-    result = await server.tools["delegate_task"](description="x", repository=str(repo))
+    result = await server.tools["delegate_task"](description="implement x", repository=str(repo))
 
     assert result["status"] == "failed"
     assert "TimeoutException" in result["error"]
@@ -292,7 +303,7 @@ async def test_delegate_task_returns_failed_dict_on_bad_repository(server):
     """A repository path that does not exist must surface as a structured
     failure rather than an unhandled subprocess/git error."""
     result = await server.tools["delegate_task"](
-        description="x", repository="/definitely/not/a/repo"
+        description="implement x", repository="/definitely/not/a/repo"
     )
 
     assert result["status"] == "failed"
@@ -306,7 +317,9 @@ async def test_resume_task_returns_failed_dict_when_execution_raises(server, tmp
     from modelhelm.tasks.models import PendingApproval
 
     task = server.task_store.create_task(description="write", repository=str(tmp_path))
-    server.task_store.set_status(task.task_id, "pending_approval", model="qwen3-coder-30b-a3b")
+    server.task_store.set_status(
+        task.task_id, "pending_approval", model="qwen3-coder-30b-a3b", task_class="testing"
+    )
     server.task_store.save_pending_approval(
         task.task_id,
         PendingApproval(
@@ -336,3 +349,78 @@ async def test_resume_task_returns_failed_dict_when_execution_raises(server, tmp
 
     assert result["status"] == "failed"
     assert "PathScopeError" in result["error"]
+
+
+# --- Phase 2: the classification gate ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_classify_task_previews_without_side_effects(server):
+    result = await server.tools["classify_task"](description="design the system architecture")
+    assert result["task_class"] == "architecture"
+    assert result["disposition"] == "claude"
+    # Pure preview: nothing was persisted.
+    all_tasks_db_path = server.task_store.db_path
+    import sqlite3
+    conn = sqlite3.connect(all_tasks_db_path)
+    count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_short_circuits_for_claude_default_class(tmp_path):
+    # Spy on FakeLlmfitClient.recommend(): TaskRouter.select_model() always
+    # calls registry.refresh(), which always calls llmfit_client.recommend().
+    # If recommend() is never invoked, the router (and therefore the
+    # registry and LM Studio) was never touched -- proving the short-circuit
+    # happens before any of Phase 1's model-selection machinery runs.
+    class SpyLlmfitClient(FakeLlmfitClient):
+        def __init__(self):
+            self.recommend_calls = 0
+
+        def recommend(self):
+            self.recommend_calls += 1
+            return super().recommend()
+
+    llmfit_spy = SpyLlmfitClient()
+    store = TaskStore(str(tmp_path / "tasks.db"))
+    server = create_server(
+        settings=Settings(agent=AgentConfig(max_iterations=2, test_before_completion=False)),
+        task_store=store,
+        lmstudio_client=FakeLMStudioClient(),
+        llmfit_client=llmfit_spy,
+    )
+
+    result = await server.tools["delegate_task"](
+        description="design the caching architecture", repository=str(tmp_path)
+    )
+
+    assert result["status"] == "escalation_recommended"
+    assert result["task_class"] == "architecture"
+    assert result["model"] == "none"
+    assert result["runtime"] == "none"
+    assert "recommend Claude" in result["summary"]
+    assert llmfit_spy.recommend_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_persists_escalation_result(server, tmp_path):
+    result = await server.tools["delegate_task"](
+        description="review this security vulnerability", repository=str(tmp_path)
+    )
+    assert result["status"] == "escalation_recommended"
+
+    task_status = await server.tools["get_task_status"](task_id=result["task_id"])
+    assert task_status["status"] == "escalation_recommended"
+    # "security" (via the "security" keyword) beats "final_review" (via
+    # "review this") because security is earlier in DEFAULT_TASK_CLASSES
+    # table order.
+    assert task_status["task_class"] == "security"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_description_escalates(server, tmp_path):
+    result = await server.tools["delegate_task"](
+        description="do the thing with the stuff", repository=str(tmp_path)
+    )
+    assert result["status"] == "escalation_recommended"
+    assert result["task_class"] == "ambiguous"
