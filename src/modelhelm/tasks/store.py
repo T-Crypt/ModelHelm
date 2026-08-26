@@ -47,6 +47,24 @@ class TaskStore:
                 )
                 """
             )
+            self._migrate_tasks_table(conn)
+
+    @staticmethod
+    def _migrate_tasks_table(conn: sqlite3.Connection) -> None:
+        """Bring a pre-existing ``tasks`` table up to the current schema.
+
+        CREATE TABLE IF NOT EXISTS is a no-op against a database written by an
+        earlier version, so a Phase-1-shape ``tasks`` table (no ``task_class``
+        column) would survive untouched and then fail every read and write with
+        a bare ``sqlite3.OperationalError: no such column: task_class``.
+
+        Adding a nullable column is non-destructive and idempotent, so this can
+        run on every open: existing rows simply get task_class = NULL, which is
+        already the value create_task() writes for a brand-new task.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "task_class" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN task_class TEXT")
 
     def create_task(self, description: str, repository: str) -> DelegatedTask:
         task = DelegatedTask(

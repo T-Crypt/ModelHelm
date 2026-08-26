@@ -1,5 +1,34 @@
+import sqlite3
+
 from modelhelm.tasks.store import TaskStore
 from modelhelm.tasks.models import TaskResult
+
+
+PHASE_1_TASKS_SCHEMA = """
+    CREATE TABLE tasks (
+        task_id TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        status TEXT NOT NULL,
+        model TEXT,
+        created_at TEXT NOT NULL
+    )
+"""
+
+
+def _write_phase_1_db(path, *, with_row=True):
+    """Create a database with the pre-milestone tasks table (no task_class)."""
+    conn = sqlite3.connect(str(path))
+    conn.execute(PHASE_1_TASKS_SCHEMA)
+    if with_row:
+        conn.execute(
+            "INSERT INTO tasks (task_id, description, repository, status, model, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-1", "add auth", "/repo", "completed", "qwen3-coder-30b-a3b",
+             "2026-01-01T00:00:00+00:00"),
+        )
+    conn.commit()
+    conn.close()
 
 
 def test_create_and_get_task(tmp_path):
@@ -133,3 +162,58 @@ def test_delete_pending_approval_is_idempotent(tmp_path):
     task = store.create_task(description="add auth", repository="/repo")
     store.delete_pending_approval(task.task_id)  # no record: must not raise
     assert store.get_pending_approval(task.task_id) is None
+
+
+# --- I1: a Phase-1-shape database must migrate, not crash -------------------
+
+def test_phase_1_database_without_task_class_column_is_migrated(tmp_path):
+    """CREATE TABLE IF NOT EXISTS never touches an existing table, so a
+    Phase-1 tasks table used to survive un-migrated and then fail every read
+    with a bare "sqlite3.OperationalError: no such column: task_class"."""
+    db = tmp_path / "phase1.db"
+    _write_phase_1_db(db)
+
+    TaskStore(str(db))  # opening must perform the migration
+
+    columns = {row[1] for row in sqlite3.connect(str(db)).execute("PRAGMA table_info(tasks)")}
+    assert "task_class" in columns
+
+
+def test_migrated_phase_1_rows_are_readable_and_preserved(tmp_path):
+    db = tmp_path / "phase1.db"
+    _write_phase_1_db(db)
+
+    store = TaskStore(str(db))
+    legacy = store.get_task("legacy-1")
+
+    # The pre-existing row survives intact and simply has no class yet.
+    assert legacy is not None
+    assert legacy.description == "add auth"
+    assert legacy.status == "completed"
+    assert legacy.model == "qwen3-coder-30b-a3b"
+    assert legacy.task_class is None
+
+
+def test_writes_work_against_a_migrated_phase_1_database(tmp_path):
+    db = tmp_path / "phase1.db"
+    _write_phase_1_db(db)
+    store = TaskStore(str(db))
+
+    task = store.create_task(description="add auth", repository="/repo")
+    store.set_status(task.task_id, "running", model="m", task_class="security")
+
+    assert store.get_task(task.task_id).task_class == "security"
+
+
+def test_migration_is_idempotent_across_reopens(tmp_path):
+    """The migration runs on every open, so it must be safe to re-run."""
+    db = tmp_path / "phase1.db"
+    _write_phase_1_db(db)
+
+    TaskStore(str(db))
+    TaskStore(str(db))
+    store = TaskStore(str(db))
+
+    assert store.get_task("legacy-1") is not None
+    columns = [row[1] for row in sqlite3.connect(str(db)).execute("PRAGMA table_info(tasks)")]
+    assert columns.count("task_class") == 1
